@@ -40,7 +40,7 @@ Available options:
 
 -s               Download files under 100 mb
 -b               Download files over 100 mb
--h,  --help     This help text
+-h,  --help      This help text
 EOF
   exit
 }
