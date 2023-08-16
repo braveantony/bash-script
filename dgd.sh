@@ -33,6 +33,12 @@ check_vars() {
 ## Print usage
 usage() {
   cat <<EOF
+Description:
+  Download Google Drive Files.
+
+Prerequest:
+  Make sure that the files you want to download on Google drive are public.
+
 Usage:
   $(basename "${BASH_SOURCE[0]}") [options] [shared link] [output file name]
 
