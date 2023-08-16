@@ -24,8 +24,9 @@ Debug() {
 ## check vars
 check_vars() {
   var_names=("Download_URL_Base" "Download_URL" "Output_File_name")
-  for var_name in "${var_names[@]}"; do
-      [ -z "${!var_name}" ] && echo "$var_name is unset." && exit 1
+  for var_name in "${var_names[@]}"
+  do
+    [ -z "${!var_name}" ] && echo "$var_name is unset." && exit 1
   done
   return 0
 }
