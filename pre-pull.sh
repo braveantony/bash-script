@@ -38,7 +38,7 @@ pull_image() {
   if [[ -f "$File" ]]; then
     Container_Images=$( cat "$File" | awk '$1 ~ /image:/ {print $2}' | sed -e 's/\"//g' | sort -u | uniq)
   elif [[ -d "$File" ]]; then
-    Files=$(find ./ -name '*.yaml' -o -name '*.yml' | tr "\n" " ")
+    Files=$(find "$File" -name '*.yaml' -o -name '*.yml' | tr "\n" " ")
     Container_Images=$( cat $Files | awk '$1 ~ /image:/ {print $2}' | sed -e 's/\"//g' | sort -u | uniq)
   fi
   for i in $Container_Images
