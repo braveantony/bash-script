@@ -21,7 +21,7 @@ Available options:
     -h:
         show this help text.
 
-Example:
+Examples:
   # 先 Pull 指定 YAML 檔中定義的所有 Container Images
   ./pre-pull -f deployment.yaml
 
