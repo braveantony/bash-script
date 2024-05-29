@@ -32,7 +32,7 @@ sudo chmod +x ./kindctl
   ./kindctl stop c30
   All nodes in c30 Cluster are Stopped.
 
-  # 啟動 c30 和 c29 叢集的所有 nodes
+  # 關閉 c30 和 c29 叢集的所有 nodes
   ./kindctl start c30 start c29
   All nodes in c30 Cluster are Stopped.
   All nodes in c29 Cluster are Stopped.
