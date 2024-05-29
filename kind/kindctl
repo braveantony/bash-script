@@ -39,6 +39,9 @@ Examples:
 
   # 關閉 c30 叢集的所有 nodes
   ./kindctl stop c30
+
+  # 啟動 c30 和 c29 叢集的所有 nodes
+  ./kindctl start c30 start c29
 EOF
   exit 0
 }
