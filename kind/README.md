@@ -16,11 +16,11 @@ sudo chmod +x ./kindctl
   kindctl [options] <Cluster Name>
 
 ## Available options:
-    start:
+  start:
         啟動指定的 Kind 叢集。
-    stop:
+  stop:
         關閉指定的 Kind 叢集。
-    -h|--help:
+  -h|--help:
         show this help text.
 
 ## Examples:
