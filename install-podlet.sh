@@ -11,8 +11,8 @@ echo "========================================="
 # 下載最新版及其 checksum
 echo ""
 echo "[1/5] 下載最新版..."
-if curl -fLO "${BASE_URL}/${BINARY}.tar.xz" && \
-   curl -fLO "${BASE_URL}/${BINARY}.tar.xz.sha256"; then
+if curl -fL# -o "${BINARY}.tar.xz"        "${BASE_URL}/${BINARY}.tar.xz" && \
+   curl -fL# -o "${BINARY}.tar.xz.sha256" "${BASE_URL}/${BINARY}.tar.xz.sha256"; then
     echo "  ✅ 下載成功"
 else
     echo "  ❌ 下載失敗，請檢查網路連線"; exit 1
