@@ -1,18 +1,30 @@
 #!/bin/bash
-# watch-endpoints.sh - 專業級 EndpointSlice 監控與 Rollout 自動化腳本
-# v2: 改用逐事件記錄 + 每 IP 狀態追蹤,避免漏抓 terminating 狀態
+# watch-endpoints.sh - EndpointSlice 變動監控腳本
+# v4: 簡化為「有變動就 show」,拿掉 terminating 狀態追蹤
+#     - 參數順序: <namespace> <service> [wait_seconds]
+#     - 新增:初始快照
+#     - 顯示 kubectl/jq 錯誤(不再 2>/dev/null)
 
-SVC_NAME="${1:-web-app}"
-NS="${2:-demo-svc}"
-WAIT_SECONDS="${4:-10}"
+NS="${1:-demo-svc}"
+SVC_NAME="${2:-web-app}"
+WAIT_SECONDS="${3:-10}"
 
 # 顯示用法說明
 usage() {
-  echo "用法: $0 [SERVICE_NAME] [NAMESPACE] [DEPLOY_NAME] [WAIT_SECONDS]"
+  echo "用法: $0 <NAMESPACE> <SERVICE_NAME> [WAIT_SECONDS]"
+  echo ""
+  echo "參數:"
+  echo "  NAMESPACE      要監控的 Namespace"
+  echo "  SERVICE_NAME   要監控的 Service 名稱"
+  echo "  WAIT_SECONDS   Rollout 成功後額外等待的秒數 (預設: 10)"
+  echo ""
+  echo "範例:"
+  echo "  $0 demo-svc web-app"
+  echo "  $0 demo-svc web-app 15"
   exit 1
 }
 
-if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+if [[ "$1" == "-h" || "$1" == "--help" || -z "$1" || -z "$2" ]]; then
   usage
 fi
 
@@ -29,41 +41,60 @@ if ! kubectl cluster-info >/dev/null 2>&1; then
   exit 1
 fi
 
+# 確認 Service 是否存在
+if ! kubectl get svc "$SVC_NAME" -n "$NS" >/dev/null 2>&1; then
+  echo "[錯誤] 找不到 Service: $NS/$SVC_NAME"
+  exit 1
+fi
+
 # 1. 自動偵測 Deployment 名稱
 detect_deployment() {
   local svc=$1
   local ns=$2
   local selector
-  selector=$(kubectl get svc "$svc" -n "$ns" -o json 2>/dev/null | jq -r '.spec.selector | to_entries | map(.key + "=" + .value) | join(",")')
+  selector=$(kubectl get svc "$svc" -n "$ns" -o json | jq -r '.spec.selector | to_entries | map(.key + "=" + .value) | join(",")')
   if [[ -z "$selector" || "$selector" == "null" ]]; then return 1; fi
   local deploy
-  deploy=$(kubectl get deployments -n "$ns" -l "$selector" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  deploy=$(kubectl get deployments -n "$ns" -l "$selector" -o jsonpath='{.items[0].metadata.name}')
   if [[ -n "$deploy" ]]; then echo "$deploy"; else return 1; fi
 }
 
-if [[ -z "$3" ]]; then
-  echo "[偵測] 正在自動尋找與 Service $SVC_NAME 關聯的 Deployment..."
-  DEPLOY_NAME=$(detect_deployment "$SVC_NAME" "$NS")
-  if [[ -z "$DEPLOY_NAME" ]]; then
-    echo "[警告] 無法自動偵測 Deployment,回退使用名稱: $SVC_NAME"
-    DEPLOY_NAME="$SVC_NAME"
-  else
-    echo "[OK] 偵測到 Deployment: $DEPLOY_NAME"
-  fi
-else
-  DEPLOY_NAME="$3"
+echo "[偵測] 正在自動尋找與 Service $SVC_NAME 關聯的 Deployment..."
+DEPLOY_NAME=$(detect_deployment "$SVC_NAME" "$NS")
+if [[ -z "$DEPLOY_NAME" ]]; then
+  echo "[錯誤] 無法自動偵測與 Service $NS/$SVC_NAME 關聯的 Deployment,退出。"
+  exit 1
 fi
+echo "[OK] 偵測到 Deployment: $DEPLOY_NAME"
 
 echo "--------------------------------------------------"
-echo "監控目標: Service/$SVC_NAME -> Deployment/$DEPLOY_NAME"
+echo "監控目標: $NS/Service/$SVC_NAME -> Deployment/$DEPLOY_NAME"
 echo "提示:將在 Rollout 成功後的 ${WAIT_SECONDS} 秒自動停止監控。"
-echo "重要:若沒抓到 terminating 狀態,建議為 Deployment 加上 preStop: sleep 2"
 echo "按 Ctrl+C 可手動停止"
 echo "--------------------------------------------------"
 
+# 2. 初始快照:列出目前所有 EndpointSlice 內容
+echo ""
+echo "[$(date +%T)] === 初始快照 (watch 開始前) ==="
+SNAPSHOT=$(kubectl get endpointslices -n "$NS" \
+  -l "kubernetes.io/service-name=$SVC_NAME" -o json)
+
+SLICE_COUNT=$(echo "$SNAPSHOT" | jq '.items | length')
+if [[ "$SLICE_COUNT" == "0" ]]; then
+  echo "  (目前沒有任何 EndpointSlice)"
+else
+  echo "$SNAPSHOT" | jq -r '
+    .items[] |
+    "  EndpointSlice: \(.metadata.name)",
+    (.endpoints // [] | sort_by(.addresses[0])[] |
+      "    \(.addresses[0])  ready=\(.conditions.ready // false)  serving=\(.conditions.serving // false)  terminating=\(.conditions.terminating // false)")
+  '
+fi
+echo ""
+
 WATCHER_PID=$$
 
-# 2. 精確的 Rollout 監控邏輯
+# 3. 自動 Rollout 監控邏輯
 auto_rollout_task() {
   set -m
   local old_gen
@@ -96,117 +127,57 @@ auto_rollout_task() {
 auto_rollout_task &
 ROLLOUT_MONITOR_PID=$!
 
-# 用 associative array 追蹤每個 IP 最後看到的狀態
-declare -A LAST_STATE
-declare -A SEEN_TERMINATING
-
 cleanup() {
   echo -e "\n[結束] $(date +%T) 停止監控。"
-
-  # 結束時做事後檢查:有哪些 IP 出現過但從未看到 terminating?
-  echo ""
-  echo "===== 事後分析:Terminating 捕捉狀況 ====="
-  if [[ ${#LAST_STATE[@]} -eq 0 ]]; then
-    echo "(本次監控期間沒有任何 endpoint 進入過 ready 狀態)"
-  else
-    for ip in "${!LAST_STATE[@]}"; do
-      if [[ "${SEEN_TERMINATING[$ip]}" == "1" ]]; then
-        echo "  ✅ $ip  曾捕捉到 terminating 狀態"
-      else
-        # 只警告那些「曾經 ready 過然後消失」的 IP
-        if [[ "${LAST_STATE[$ip]}" == "DISAPPEARED_WHILE_READY" ]]; then
-          echo "  ❌ $ip  Pod 直接消失,未捕捉到 terminating(建議檢查 preStop hook)"
-        elif [[ "${LAST_STATE[$ip]}" == "STILL_READY" ]]; then
-          echo "  ⏸  $ip  監控結束時仍為 ready(未被刪除)"
-        fi
-      fi
-    done
-  fi
-  echo "=========================================="
-
   kill -- -"$ROLLOUT_MONITOR_PID" 2>/dev/null
   exit 0
 }
 
 trap cleanup SIGINT SIGTERM
 
-# 3. 逐事件串流監控核心
-# 關鍵改動:
-#   - 不再用 hash 比對「快照」,而是每個 watch event 都印出來
-#   - 額外輸出每個 endpoint 的明細,並透過 stdin 餵給 bash 做狀態追蹤
-#   - 用 NDJSON 格式每行一個事件,bash 端逐行解析
+# 4. 逐事件串流監控:有變動就 show
+# - kubectl --watch 推送 EndpointSlice 變動事件
+# - jq 把每個事件壓成單行 NDJSON
+# - bash 端逐行解析並印出
+# - 用 process substitution 讓 while 在主 shell 跑
 
-kubectl get endpointslices -n "$NS" \
-  -l "kubernetes.io/service-name=$SVC_NAME" \
-  --watch -o json 2>/dev/null | \
-jq -u -r -c --unbuffered '
-  select(.type != "ERROR" and .type != null) |
-  {
-    evt: .type,
-    ts: now,
-    eps: (.object.endpoints // [] | sort_by(.addresses[0]) |
-          map({
-            ip: .addresses[0],
-            ready: (.conditions.ready // false),
-            serving: (.conditions.serving // false),
-            terminating: (.conditions.terminating // false)
-          }))
-  } |
-  @json
-' | while IFS= read -r EVT_JSON; do
+while IFS= read -r EVT_JSON; do
   [[ -z "$EVT_JSON" ]] && continue
 
   EVT_TYPE=$(echo "$EVT_JSON" | jq -r '.evt')
+  SLICE_NAME=$(echo "$EVT_JSON" | jq -r '.name')
   TS_NOW=$(date +%T.%3N)
-  TS_EPOCH=$(date +%s.%3N)
 
-  echo "[$TS_EPOCH|$TS_NOW] === EndpointSlice 事件: $EVT_TYPE ==="
+  echo "[$TS_NOW] === 事件: $EVT_TYPE  EndpointSlice: $SLICE_NAME ==="
 
-  # 收集本次事件中出現的所有 IP
-  CURRENT_IPS=()
-  while IFS= read -r EP_LINE; do
-    IP=$(echo "$EP_LINE" | jq -r '.ip')
-    READY=$(echo "$EP_LINE" | jq -r '.ready')
-    SERVING=$(echo "$EP_LINE" | jq -r '.serving')
-    TERMINATING=$(echo "$EP_LINE" | jq -r '.terminating')
-
-    [[ -z "$IP" || "$IP" == "null" ]] && continue
-    CURRENT_IPS+=("$IP")
-
-    # 標記:這個 IP 在本次事件的狀態
-    STATE_MARK=""
-    if [[ "$TERMINATING" == "true" ]]; then
-      STATE_MARK="  ⚠ TERMINATING"
-      SEEN_TERMINATING[$IP]=1
-      LAST_STATE[$IP]="TERMINATING"
-    elif [[ "$READY" == "true" ]]; then
-      LAST_STATE[$IP]="STILL_READY"
-    fi
-
-    echo "  $IP  ready=$READY  serving=$SERVING  terminating=$TERMINATING$STATE_MARK"
-  done < <(echo "$EVT_JSON" | jq -c '.eps[]')
-
-  # 檢查上一輪有但這輪沒有的 IP(消失了)
-  for prev_ip in "${!LAST_STATE[@]}"; do
-    found=0
-    for cur_ip in "${CURRENT_IPS[@]}"; do
-      if [[ "$prev_ip" == "$cur_ip" ]]; then
-        found=1
-        break
-      fi
-    done
-    if [[ $found -eq 0 ]]; then
-      # 這個 IP 消失了
-      if [[ "${LAST_STATE[$prev_ip]}" == "STILL_READY" ]]; then
-        # ❌ 這就是漏抓 terminating 的情境
-        echo "  💥 $prev_ip  從 ready 直接消失(未經 terminating 過渡!)"
-        LAST_STATE[$prev_ip]="DISAPPEARED_WHILE_READY"
-      elif [[ "${LAST_STATE[$prev_ip]}" == "TERMINATING" ]]; then
-        echo "  🪦 $prev_ip  已從 EndpointSlice 移除(正常流程)"
-        unset LAST_STATE[$prev_ip]
-      fi
-    fi
-  done
+  EP_COUNT=$(echo "$EVT_JSON" | jq '.eps | length')
+  if [[ "$EP_COUNT" == "0" ]]; then
+    echo "  (此 EndpointSlice 目前沒有 endpoint)"
+  else
+    echo "$EVT_JSON" | jq -r '
+      .eps[] |
+      "  \(.ip)  ready=\(.ready)  serving=\(.serving)  terminating=\(.terminating)"
+    '
+  fi
 
   echo ""
-done
+done < <(
+  kubectl get endpointslices -n "$NS" \
+    -l "kubernetes.io/service-name=$SVC_NAME" \
+    --watch --output-watch-events=true -o json | \
+  jq -r -c --unbuffered '
+    select(.type != null and .type != "ERROR") |
+    {
+      evt: .type,
+      name: (.object.metadata.name // "unknown"),
+      eps: (.object.endpoints // [] | sort_by(.addresses[0]) |
+            map({
+              ip: .addresses[0],
+              ready: (.conditions.ready // false),
+              serving: (.conditions.serving // false),
+              terminating: (.conditions.terminating // false)
+            }))
+    } |
+    @json
+  '
+)
