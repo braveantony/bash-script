@@ -20,7 +20,9 @@ kubectl wait pod -l "app=$DEPLOYMENT" --for=delete --timeout=40s > /dev/null 2>&
 kubectl wait pod/"$CLIENT_POD" --for=delete --timeout=40s > /dev/null 2>&1 || true
 
 WORK_DIR=$(mktemp -d)
-trap 'kubectl delete deployment "$DEPLOYMENT" --ignore-not-found --wait=false > /dev/null 2>&1 || true
+LOG_PID=""
+trap 'kill $LOG_PID 2>/dev/null || true
+      kubectl delete deployment "$DEPLOYMENT" --ignore-not-found --wait=false > /dev/null 2>&1 || true
       kubectl delete pod "$CLIENT_POD" --ignore-not-found --wait=false > /dev/null 2>&1 || true
       kill $(jobs -p) 2>/dev/null || true
       wait 2>/dev/null || true
@@ -59,7 +61,15 @@ kubectl exec "$CLIENT_POD" -- curl -sf --max-time 5 "http://$POD_IP:8080/healthz
 echo "→ client Pod 可連線到 server Pod"
 
 echo ""
-echo "=== [3] 建立閒置連線 ==="
+echo "=== [3] 開始 follow Pod log（避免 Pod 被刪後 log 撈不到）==="
+kubectl logs -f "$POD" > "$WORK_DIR/gs.log" 2>&1 &
+LOG_PID=$!
+sleep 0.5
+kill -0 $LOG_PID 2>/dev/null || { echo "ERROR: kubectl logs -f 啟動失敗"; exit 1; }
+echo "→ log stream 已啟動（PID: $LOG_PID），log 寫入 $WORK_DIR/gs.log"
+
+echo ""
+echo "=== [4] 建立閒置連線 ==="
 kubectl exec "$CLIENT_POD" -- sh -c \
   "(printf 'GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n'; \
     sleep 0.5; \
@@ -73,14 +83,14 @@ echo "→ 同一條連線送兩個請求，兩次都收到回應，連線目前�
 kubectl exec "$CLIENT_POD" -- grep -o "HTTP/1.1 [0-9]* [A-Z]*" /tmp/gs-nc-resp.txt | nl
 
 echo ""
-echo "=== [4] 建立 active 連線 ==="
+echo "=== [5] 建立 active 連線 ==="
 kubectl exec "$CLIENT_POD" -- sh -c "curl -s http://$POD_IP:8080/slow > /tmp/gs-slow-resp.txt" &
 SLOW_BG_PID=$!
 sleep 0.3
 echo "→ /slow 請求已送出，handler 正在執行"
 
 echo ""
-echo "=== [5] SIGTERM 前：兩條連線都正常，看不出閒置與處理中的差異 ==="
+echo "=== [6] SIGTERM 前：兩條連線都正常，看不出閒置與處理中的差異 ==="
 echo "$ kubectl exec $CLIENT_POD -- ss -tnp 'dport = :8080'"
 SS_BEFORE=$(kubectl exec "$CLIENT_POD" -- ss -tnp 'dport = :8080')
 echo "$SS_BEFORE"
@@ -89,14 +99,14 @@ ESTAB_BEFORE=$(echo "$SS_BEFORE" | grep -c ESTAB)
 echo "→ nc 和 curl 連線都正常，符合預期"
 
 echo ""
-echo "=== [6] 發送 SIGTERM（kubectl delete deployment）==="
+echo "=== [7] 發送 SIGTERM（kubectl delete deployment）==="
 kubectl delete deployment "$DEPLOYMENT" --wait=false > /dev/null \
   || { echo "ERROR: 無法刪除 Deployment"; exit 1; }
 echo "→ SIGTERM 已送出（K8s 控制器傳送給 Pod）"
 sleep 1
 
 echo ""
-echo "=== [7] 驗證一：立刻停止接受新的連線請求 ==="
+echo "=== [8] 驗證一：立刻停止接受新的連線請求 ==="
 echo "$ kubectl exec $CLIENT_POD -- curl -sf --max-time 1 http://$POD_IP:8080/healthz > /dev/null 2>&1; echo \$?"
 LISTENER_CODE=$(kubectl exec "$CLIENT_POD" -- sh -c \
   "curl -sf --max-time 1 http://$POD_IP:8080/healthz > /dev/null 2>&1; echo \$?")
@@ -106,7 +116,7 @@ echo "→ 新連線未收到成功回應，立刻停止接受新的連線請求�
 echo "→ 行為一驗證通過"
 
 echo ""
-echo "=== [8] 驗證二：閒置連線已被關閉，處理中連線仍維持 ==="
+echo "=== [9] 驗證二：閒置連線已被關閉，處理中連線仍維持 ==="
 echo "$ kubectl exec $CLIENT_POD -- ss -tnp 'dport = :8080'"
 SS_AFTER=$(kubectl exec "$CLIENT_POD" -- ss -tnp 'dport = :8080')
 echo "$SS_AFTER"
@@ -118,7 +128,7 @@ echo "→ nc 連線關閉中（閒置連線已關），curl 連線正常（處�
 echo "→ 行為二驗證通過"
 
 echo ""
-echo "=== [9] 驗證三：等待正在處理中的請求自然完成才退出 ==="
+echo "=== [10] 驗證三：等待正在處理中的請求自然完成才退出 ==="
 # 同時在背景 poll exit code，利用等待 /slow 的視窗，避免錯過 Pod Terminated 窗口
 {
   for i in $(seq 1 60); do
@@ -142,11 +152,11 @@ echo "→ /slow 回應：$SLOW_RESP"
 echo "→ 行為三驗證通過"
 
 echo ""
-echo "=== [10] Pod exit code（預期 0）==="
+echo "=== [11] Pod exit code（預期 0）==="
 wait $EXIT_POLL_PID 2>/dev/null || true
 SERVER_EXIT=$(cat "$WORK_DIR/exit-code.txt" 2>/dev/null)
 if [[ "$SERVER_EXIT" == "DELETED" ]]; then
-  echo "→ Pod 已被 K8s 清除（exit code 將由 step [11] log 確認）"
+  echo "→ Pod 已被 K8s 清除（exit code 將由 step [12] log 確認）"
 elif [[ -n "$SERVER_EXIT" ]] && [[ $SERVER_EXIT -eq 0 ]]; then
   echo "→ exit code：$SERVER_EXIT"
 else
@@ -154,10 +164,23 @@ else
 fi
 
 echo ""
-echo "=== [11] Pod log ==="
-echo "$ kubectl logs $POD"
-kubectl logs "$POD" 2>&1 | tee "$WORK_DIR/gs.log"
-[[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "ERROR: kubectl logs 失敗，Pod 可能已被 K8s 清除"; exit 1; }
+echo "=== [12] Pod log（從預先啟動的 follow stream 收集）==="
+# 等 kubectl logs -f 自然結束（Pod 真的退出後 stream 會 EOF）
+# 設個 timeout 避免無窮等
+for i in $(seq 1 20); do
+  if ! kill -0 $LOG_PID 2>/dev/null; then break; fi
+  sleep 0.5
+done
+# 若超時仍未結束就主動 kill
+if kill -0 $LOG_PID 2>/dev/null; then
+  kill $LOG_PID 2>/dev/null || true
+  sleep 0.3
+fi
+wait $LOG_PID 2>/dev/null || true
+
+echo "$ kubectl logs $POD（從 $WORK_DIR/gs.log 讀取）"
+cat "$WORK_DIR/gs.log"
+[[ -s "$WORK_DIR/gs.log" ]] || { echo "ERROR: log 檔案為空，可能 follow stream 未正常啟動"; exit 1; }
 grep -q "server exited cleanly" "$WORK_DIR/gs.log" \
   || { echo "ERROR: log 未見 'server exited cleanly'，server 可能非正常退出"; exit 1; }
 SIGNAL_LINE=$(grep -n "received signal" "$WORK_DIR/gs.log" | head -1 | cut -d: -f1)
